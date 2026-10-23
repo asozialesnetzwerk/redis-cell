@@ -1,0 +1,221 @@
+name: Build OCI images
+on:
+  schedule:
+    - cron: "0 22 * * *"
+  push:
+    tags: [ v* ]
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+
+  build-oci-image:
+    name: Build ${{ matrix.os.arch }} ${{ matrix.variant.distro }} OCI image
+    strategy:
+      matrix:
+        variant:
+          - distro: Debian
+            variant: debian
+            containerfile: Containerfile
+            tag-suffix: ''
+          - distro: Alpine
+            variant: alpine
+            containerfile: alpine.Containerfile
+            tag-suffix: -alpine
+        os:
+          - label: ubuntu-26.04
+            arch: x86_64
+          - label: ubuntu-26.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.os.label }}
+    permissions:
+      packages: write
+    steps:
+      - name: Download youki
+        run: |
+          wget "https://github.com/youki-dev/youki/releases/download/v${VERSION}/youki-${VERSION}-${{ matrix.os.arch }}-musl.tar.gz"
+          tar xOf "youki-${VERSION}-${{ matrix.os.arch }}-musl.tar.gz" youki > /opt/youki
+          rm -f "youki-${VERSION}-${{ matrix.os.arch }}-musl.tar.gz"
+          chmod +x /opt/youki
+        env:
+          VERSION: 0.6.0
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          filter: blob:none
+          fetch-depth: 0
+      - name: Build image
+        run: |
+          sudo buildah build \
+              --runtime /opt/youki \
+              -f "${{ matrix.variant.containerfile }}" \
+              -t redis-cell \
+              --created-annotation \
+              --timestamp="$(git show --no-patch --format=%ct HEAD)" \
+              --annotation org.opencontainers.image.revision="$(git rev-parse HEAD)" \
+              --annotation org.opencontainers.image.source="https://github.com/${{ github.repository }}" \
+              --annotation org.opencontainers.image.vendor="Das Asoziale Netzwerk" \
+              --annotation org.opencontainers.image.base.name="redis-cell" \
+            ;
+          sudo buildah inspect redis-cell
+      - name: Save image
+        run: sudo buildah push --all --format=oci --compression-format=zstd:chunked --compression-level=20 redis-cell "oci-archive:oci-archive-${{ matrix.os.arch }}.tar"
+      - name: Upload as build artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.variant.variant }}-oci-image-${{ matrix.os.arch }}
+          path: oci-archive-${{ matrix.os.arch }}.tar
+
+  combine-oci-images:
+    name: Combine ${{ matrix.variant.distro }} OCI images
+    runs-on: ubuntu-26.04
+    needs:
+      - build-oci-image
+    permissions:
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - distro: Debian
+            variant: debian
+            containerfile: Containerfile
+            tag-suffix: ''
+          - distro: Alpine
+            variant: alpine
+            containerfile: alpine.Containerfile
+            tag-suffix: -alpine
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v8
+        with:
+          pattern: ${{ matrix.variant.variant }}-oci-image-*
+          merge-multiple: true
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: 3.14
+      - name: Create manifest with annotations
+        shell: python
+        run: |
+          import json, subprocess, sys
+
+          def run(command: list[str]) -> str:
+            print("+", *command, file=sys.stderr, flush=True)
+            return subprocess.run(command, check=True, text=True, stdout=subprocess.PIPE).stdout.strip()
+
+          image = run(["sudo", "buildah", "pull", "oci-archive:oci-archive-x86_64.tar"])
+
+          manifest = json.loads(run(["sudo", "buildah", "inspect", image]))
+
+          annotations = []
+
+          for (key, value) in manifest["ImageAnnotations"].items():
+            if not key.startswith("org.opencontainers.image."):
+              continue
+            if key == "org.opencontainers.image.base.digest":
+              continue
+            annotations.extend(["--annotation", f"{key}={value}"])
+
+          print(run(["sudo", "buildah", "manifest", "create", *annotations, "redis-cell"]))
+      - name: Add images to manifest
+        run: |
+          set -x
+          for file in oci-archive-*
+          do
+            sudo buildah pull "oci-archive:$file"
+            sudo buildah manifest add redis-cell "oci-archive:$file"
+          done
+      - name: Push manifest
+        run: sudo buildah manifest push --compression-level 20 --add-compression zstd:chunked --compression-format zstd:chunked --all redis-cell "oci-archive:oci-archive.tar"
+      - name: Upload as build artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: oci-image${{ matrix.variant.tag-suffix }}
+          path: oci-archive.tar
+
+  e2e-redis:
+    runs-on: ${{ matrix.os.label }}
+    name: End-to-end tests against Redis
+    needs:
+      - build-oci-image
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - distro: Debian
+            variant: debian
+            containerfile: Containerfile
+            tag-suffix: ''
+          - distro: Alpine
+            variant: alpine
+            containerfile: alpine.Containerfile
+            tag-suffix: -alpine
+        os:
+          - label: ubuntu-26.04
+            arch: x86_64
+          - label: ubuntu-26.04-arm
+            arch: aarch64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Download artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ matrix.variant.variant }}-oci-image-${{ matrix.os.arch }}
+      - name: Load image
+        run: |
+            sudo podman tag "$(sudo buildah pull oci-archive:oci-archive-${{ matrix.os.arch }}.tar)" redis-cell:latest
+            sudo podman inspect redis-cell:latest
+      - name: Install stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run end-to-end tests
+        run: |
+            set -xeu
+            DIR="${XDG_RUNTIME_DIR}/podman"
+            SOCK="${DIR}/podman.sock"
+            mkdir -p "${DIR}"
+            export "DOCKER_HOST=unix://${SOCK}"
+            sudo podman system service --time=0 "${DOCKER_HOST}" &
+            sleep 5
+            sudo chmod 777 "${SOCK}"
+            cargo test --release --features e2e-test --test e2e -- --nocapture
+
+  push-oci-image:
+    name: Push ${{ matrix.variant.distro }} OCI image
+    runs-on: ubuntu-26.04
+    needs:
+      - combine-oci-images
+      - e2e-redis
+    if: github.event_name == 'push' || github.event_name == 'schedule'
+    permissions:
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - distro: Debian
+            variant: debian
+            containerfile: Containerfile
+            tag-suffix: ''
+          - distro: Alpine
+            variant: alpine
+            containerfile: alpine.Containerfile
+            tag-suffix: -alpine
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: oci-image${{ matrix.variant.tag-suffix }}
+      - name: Log in to ghcr.io
+        uses: redhat-actions/podman-login@v1
+        with:
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+          registry: ghcr.io/${{ github.repository }}
+      - name: Push image to ghcr.io as nightly
+        run: skopeo copy --all --preserve-digests oci-archive:oci-archive.tar docker://ghcr.io/${{ github.repository }}:nightly${{ matrix.variant.tag-suffix }}
+      - name: Push image to ghcr.io as latest
+        run: skopeo copy --all --preserve-digests oci-archive:oci-archive.tar docker://ghcr.io/${{ github.repository }}:latest${{ matrix.variant.tag-suffix }}
+        if: github.event_name == 'push'
