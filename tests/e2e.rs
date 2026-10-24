@@ -70,6 +70,7 @@ async fn it_works() {
 mod utils {
     use redis::aio::ConnectionManager;
     use std::sync::LazyLock;
+    use std::time::Duration;
     use testcontainers::ContainerAsync;
     use testcontainers::core::IntoContainerPort as _;
     use testcontainers::runners::AsyncRunner;
@@ -84,14 +85,16 @@ mod utils {
             })
             .unwrap_or(3)
     });
-    static REDIS_CLIENT_MAX_DELAY: LazyLock<u64> = LazyLock::new(|| {
-        std::env::var("REDIS_CLIENT_MAX_DELAY")
-            .ok()
-            .map(|val| {
-                val.parse()
-                    .expect("valid u64 value to have been passed from env")
-            })
-            .unwrap_or(1000)
+    static REDIS_CLIENT_MAX_DELAY: LazyLock<Duration> = LazyLock::new(|| {
+        Duration::from_millis(
+            std::env::var("REDIS_CLIENT_MAX_DELAY")
+                .ok()
+                .map(|val| {
+                    val.parse()
+                        .expect("valid u64 value to have been passed from env")
+                })
+                .unwrap_or(1000),
+        )
     });
 
     pub(super) async fn setup() -> (ContainerAsync<GenericImage>, ConnectionManager) {

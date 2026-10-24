@@ -24,6 +24,6 @@ time = { version = "0.3", features = ["formatting"] }
 cc = "1.2"
 
 [dev-dependencies]
-redis = { version = "0.32", features = ["connection-manager", "tokio-comp"] }
-testcontainers = { version = "0.25", features = ["reusable-containers"] }
+redis = { version = "1.8.0", features = ["connection-manager", "tokio-comp"] }
+testcontainers = { version = "0.28", features = ["reusable-containers"] }
 tokio = { version = "1.48", features = ["macros"] }
